@@ -4,6 +4,11 @@ name: Release
 # from a number typed here, so a release cannot drift from its history.
 on:
   workflow_dispatch:
+    inputs:
+      publish_to_marketplace:
+        description: 'This release should also be published to the GitHub Marketplace'
+        type: boolean
+        default: false
 
 permissions:
   # Creating the tag and the release. Nothing else.
@@ -32,6 +37,31 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
+
+      # Read the current latest release first, so the summary can tell a real
+      # release apart from a run where semantic-release decided there was
+      # nothing to publish.
+      #
+      # A 404 means the repository genuinely has no release yet, which is the
+      # normal state before a first release. Anything else is a failure and is
+      # recorded as such, because collapsing a 403 or a network blip into "no
+      # release" would make the summary state a confident wrong answer.
+      - name: Record the current release
+        id: before
+        run: |
+          err=$(mktemp)
+          if tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>"$err"); then
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "failed=false" >> "$GITHUB_OUTPUT"
+          elif grep -q 'HTTP 404' "$err"; then
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "failed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       # No npm plugin: this is a GitHub Action, the tag is the version.
       # The plugins resolve from the .releaserc.json, so the major below only
       # pins the core tool. semantic-release resolves and installs missing
@@ -42,6 +72,106 @@ jobs:
       # a release job should not depend on where the node line happens to sit.
       # Version 24 requires >= 20.8.1 and has no floor to trip over.
       - name: Release
+        id: release
         run: npx --yes semantic-release@24
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # GitHub has no API for publishing an action to the Marketplace and no way
+      # to read back whether a release was published there, so the checkbox
+      # cannot do the work itself. It records the intent and links straight to
+      # the one remaining manual step, which is the part that gets forgotten.
+      #
+      # Read again afterwards, retrying briefly, since a release created moments
+      # ago may not be visible to an immediately following read.
+      - name: Read the published release
+        id: after
+        run: |
+          err=$(mktemp)
+          for _ in 1 2 3; do
+            if tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>"$err"); then
+              echo "tag=$tag" >> "$GITHUB_OUTPUT"
+              echo "failed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if grep -q 'HTTP 404' "$err"; then
+              break
+            fi
+            sleep 2
+          done
+          if grep -q 'HTTP 404' "$err"; then
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "failed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Everything this step is told arrives through the environment rather than
+      # through ${{ }} interpolation into the script body. A git tag may legally
+      # contain backticks, $, ; and quotes, so a tag read from the API and
+      # spliced into shell source would be arbitrary code execution.
+      - name: Summarise
+        if: always()
+        continue-on-error: true
+        run: |
+          # True only when this run actually created a release. Everything else,
+          # including "nothing new was published", must not offer to publish
+          # something to the Marketplace: the edit link would point at the
+          # previous release, which is already published.
+          published_now=false
+          if [ "$RELEASE_OUTCOME" = "success" ] &&
+             [ "$BEFORE_FAILED" != "true" ] && [ "$AFTER_FAILED" != "true" ] &&
+             [ -n "$AFTER_TAG" ] && [ "$AFTER_TAG" != "$BEFORE_TAG" ]; then
+            published_now=true
+          fi
+          {
+            echo "## Release"
+            echo
+            if [ "$RELEASE_OUTCOME" != "success" ]; then
+              echo "The release step did not succeed, outcome \`$RELEASE_OUTCOME\`."
+              echo "Nothing is reported below, because the run may have failed or"
+              echo "been cancelled rather than found nothing to do. Check its log"
+              echo "before concluding that there is no release."
+            elif [ "$BEFORE_FAILED" = "true" ] || [ "$AFTER_FAILED" = "true" ]; then
+              echo "The release step finished, but reading the release list failed,"
+              echo "so whether it published is **unknown**. Check the Releases page:"
+              echo "- [Releases](https://github.com/$GITHUB_REPOSITORY/releases)"
+            elif [ -z "$AFTER_TAG" ] && [ -z "$BEFORE_TAG" ]; then
+              echo "No release was published. semantic-release found no relevant"
+              echo "changes, which is expected when the commits on main are chore,"
+              echo "docs, refactor or test commits."
+            elif [ "$AFTER_TAG" = "$BEFORE_TAG" ]; then
+              echo "No release was published. semantic-release found no relevant"
+              echo "changes since \`$BEFORE_TAG\`."
+            else
+              echo "Published \`$AFTER_TAG\` (was ${BEFORE_TAG:-none})."
+            fi
+            echo
+            if [ "$PUBLISH_BOX" != "true" ]; then
+              echo "Not publishing to the Marketplace. To change that, publish the"
+              echo "existing release by hand, or re-run with the box ticked."
+            elif [ "$published_now" != "true" ]; then
+              echo "The Marketplace box was ticked, but this run did not create a"
+              echo "release, so there is nothing new to publish there."
+            else
+              echo "### Marketplace: one manual step left"
+              echo
+              echo "Publishing an action to the Marketplace has no API. Open the"
+              echo "release, tick **Publish this Action to the GitHub Marketplace**"
+              echo "and save. Until that is done the release exists but the action"
+              echo "is not discoverable in the Marketplace."
+              echo
+              echo "- [Edit $AFTER_TAG](https://github.com/$GITHUB_REPOSITORY/releases/edit/$AFTER_TAG)"
+              echo "- [Releases](https://github.com/$GITHUB_REPOSITORY/releases)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BEFORE_TAG: ${{ steps.before.outputs.tag }}
+          BEFORE_FAILED: ${{ steps.before.outputs.failed }}
+          AFTER_TAG: ${{ steps.after.outputs.tag }}
+          AFTER_FAILED: ${{ steps.after.outputs.failed }}
+          RELEASE_OUTCOME: ${{ steps.release.outcome }}
+          PUBLISH_BOX: ${{ inputs.publish_to_marketplace }}
