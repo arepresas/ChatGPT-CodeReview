@@ -1,10 +1,11 @@
+import { Chat } from '../src/chat';
 import {
   createInlineReviewComment,
   createReviewBody,
   getChangedFiles,
   getReviewCommentLocation,
   isHunkHeaderInPatch,
-  robot,
+  loadChat,
 } from '../src/bot';
 
 const pullRequestFiles = [
@@ -61,15 +62,28 @@ const createBotReview = (
   user: { type: 'Bot' },
 });
 
-const createContext = ({
-  action = 'synchronize',
-  before = 'previous-head',
+const createIncompleteBotReview = (
+  commitId: string | null = 'partial-head'
+) => ({
+  body: '> **Review incomplete.**\n\n<!-- chatgpt-code-review incomplete -->',
+  commit_id: commitId,
+  user: { type: 'Bot' },
+});
+
+const baseParams = {
+  owner: 'owner',
+  repo: 'repo',
+  pull_number: 123,
+  action: 'synchronize',
+  before: 'previous-head',
+  headSha: 'current-head',
+};
+
+const createOctokit = ({
   reviews = [],
   comparisons = [],
   reviewsError,
 }: {
-  action?: 'opened' | 'synchronize';
-  before?: string;
   reviews?: Array<{
     body: string;
     commit_id?: string | null;
@@ -84,21 +98,12 @@ const createContext = ({
   >;
   reviewsError?: Error;
 } = {}) => {
-  const compareCommits = jest.fn();
   const listFiles = jest.fn();
   const listReviews = jest.fn();
-  const paginate = jest.fn((method) => {
-    if (method === listFiles) {
-      return Promise.resolve(pullRequestFiles);
-    }
-    if (method === listReviews) {
-      if (reviewsError) {
-        return Promise.reject(reviewsError);
-      }
-      return Promise.resolve(reviews);
-    }
-    return Promise.reject(new Error('unexpected pagination method'));
-  });
+  const compareCommits = jest.fn();
+  const createReview = jest.fn();
+  const getRepoVariable = jest.fn();
+  const createComment = jest.fn();
 
   for (const comparison of comparisons) {
     if (comparison instanceof Error) {
@@ -108,50 +113,60 @@ const createContext = ({
     }
   }
 
+  const rest = {
+    pulls: {
+      listFiles,
+      listReviews,
+      createReview,
+    },
+    repos: {
+      compareCommits,
+    },
+    actions: {
+      getRepoVariable,
+    },
+    issues: {
+      createComment,
+    },
+  };
+
+  const paginate = jest.fn(async (method: unknown) => {
+    if (method === listFiles) {
+      return pullRequestFiles;
+    }
+    if (method === listReviews) {
+      if (reviewsError) {
+        throw reviewsError;
+      }
+      return reviews;
+    }
+    throw new Error('unexpected pagination method');
+  });
+
   return {
-    context: {
-      repo: () => ({ owner: 'owner', repo: 'repo' }),
-      pullRequest: () => ({
-        owner: 'owner',
-        repo: 'repo',
-        pull_number: 123,
-      }),
-      payload: {
-        action,
-        before,
-        pull_request: {
-          head: { sha: 'current-head' },
-        },
-      },
-      octokit: {
-        paginate,
-        pulls: {
-          listFiles,
-          listReviews,
-        },
-        repos: {
-          compareCommits,
-        },
-      },
-    } as any,
+    octokit: { paginate, rest } as any,
     compareCommits,
     listFiles,
     listReviews,
     paginate,
+    getRepoVariable,
+    createComment,
   };
 };
 
 describe('getChangedFiles', () => {
   test('uses the current pull request files when the pull request is opened', async () => {
-    const { context, compareCommits } = createContext({ action: 'opened' });
+    const { octokit, compareCommits, listReviews } = createOctokit();
 
-    await expect(getChangedFiles(context)).resolves.toEqual(pullRequestFiles);
-    expect(context.octokit.pulls.listReviews).not.toHaveBeenCalled();
+    await expect(
+      getChangedFiles(octokit, { ...baseParams, action: 'opened' })
+    ).resolves.toEqual(pullRequestFiles);
+    expect(listReviews).not.toHaveBeenCalled();
     expect(compareCommits).not.toHaveBeenCalled();
   });
 
   test('uses current pull request patches for files in an incremental diff', async () => {
-    const { context, compareCommits } = createContext({
+    const { octokit, compareCommits } = createOctokit({
       reviews: [createBotReview()],
       comparisons: [
         {
@@ -161,7 +176,7 @@ describe('getChangedFiles', () => {
       ],
     });
 
-    await expect(getChangedFiles(context)).resolves.toEqual([
+    await expect(getChangedFiles(octokit, baseParams)).resolves.toEqual([
       pullRequestFiles[1],
     ]);
     expect(compareCommits).toHaveBeenCalledWith({
@@ -173,7 +188,7 @@ describe('getChangedFiles', () => {
   });
 
   test('ignores matching review text from a human reviewer', async () => {
-    const { context, compareCommits } = createContext({
+    const { octokit, compareCommits } = createOctokit({
       reviews: [
         {
           body: 'LGTM 👍',
@@ -189,7 +204,7 @@ describe('getChangedFiles', () => {
       ],
     });
 
-    await expect(getChangedFiles(context)).resolves.toEqual([
+    await expect(getChangedFiles(octokit, baseParams)).resolves.toEqual([
       pullRequestFiles[1],
     ]);
     expect(compareCommits).toHaveBeenCalledTimes(1);
@@ -202,7 +217,7 @@ describe('getChangedFiles', () => {
   });
 
   test('uses the full pull request for a legacy bot review without the marker', async () => {
-    const { context, compareCommits } = createContext({
+    const { octokit, compareCommits } = createOctokit({
       reviews: [
         {
           body: 'Code review by ChatGPT',
@@ -212,30 +227,36 @@ describe('getChangedFiles', () => {
       ],
     });
 
-    await expect(getChangedFiles(context)).resolves.toEqual(pullRequestFiles);
+    await expect(getChangedFiles(octokit, baseParams)).resolves.toEqual(
+      pullRequestFiles
+    );
     expect(compareCommits).not.toHaveBeenCalled();
   });
 
   test('uses the full pull request when a trusted review has no commit', async () => {
-    const { context, compareCommits } = createContext({
+    const { octokit, compareCommits } = createOctokit({
       reviews: [createBotReview('Code review by ChatGPT', null)],
     });
 
-    await expect(getChangedFiles(context)).resolves.toEqual(pullRequestFiles);
+    await expect(getChangedFiles(octokit, baseParams)).resolves.toEqual(
+      pullRequestFiles
+    );
     expect(compareCommits).not.toHaveBeenCalled();
   });
 
   test('uses the full pull request when review history cannot be listed', async () => {
-    const { context, compareCommits } = createContext({
+    const { octokit, compareCommits } = createOctokit({
       reviewsError: new Error('reviews unavailable'),
     });
 
-    await expect(getChangedFiles(context)).resolves.toEqual(pullRequestFiles);
+    await expect(getChangedFiles(octokit, baseParams)).resolves.toEqual(
+      pullRequestFiles
+    );
     expect(compareCommits).not.toHaveBeenCalled();
   });
 
   test('excludes files that are only present in an ahead comparison', async () => {
-    const { context } = createContext({
+    const { octokit } = createOctokit({
       reviews: [createBotReview()],
       comparisons: [
         {
@@ -245,7 +266,7 @@ describe('getChangedFiles', () => {
       ],
     });
 
-    await expect(getChangedFiles(context)).resolves.toEqual([]);
+    await expect(getChangedFiles(octokit, baseParams)).resolves.toEqual([]);
   });
 
   test('falls back when a comparison reaches the GitHub file limit', async () => {
@@ -255,7 +276,7 @@ describe('getChangedFiles', () => {
       contents_url: `https://api.github.com/repos/owner/repo/contents/src/file-${index}.ts`,
       patch: 'commit comparison patch',
     }));
-    const { context } = createContext({
+    const { octokit } = createOctokit({
       reviews: [createBotReview()],
       comparisons: [
         {
@@ -265,11 +286,13 @@ describe('getChangedFiles', () => {
       ],
     });
 
-    await expect(getChangedFiles(context)).resolves.toEqual(pullRequestFiles);
+    await expect(getChangedFiles(octokit, baseParams)).resolves.toEqual(
+      pullRequestFiles
+    );
   });
 
   test('falls back when an ahead comparison omits files', async () => {
-    const { context } = createContext({
+    const { octokit } = createOctokit({
       reviews: [createBotReview()],
       comparisons: [
         {
@@ -278,11 +301,13 @@ describe('getChangedFiles', () => {
       ],
     });
 
-    await expect(getChangedFiles(context)).resolves.toEqual(pullRequestFiles);
+    await expect(getChangedFiles(octokit, baseParams)).resolves.toEqual(
+      pullRequestFiles
+    );
   });
 
   test('returns no files for an identical comparison', async () => {
-    const { context } = createContext({
+    const { octokit } = createOctokit({
       reviews: [createBotReview()],
       comparisons: [
         {
@@ -291,11 +316,11 @@ describe('getChangedFiles', () => {
       ],
     });
 
-    await expect(getChangedFiles(context)).resolves.toEqual([]);
+    await expect(getChangedFiles(octokit, baseParams)).resolves.toEqual([]);
   });
 
   test('falls back to the current pull request files after diverged comparisons', async () => {
-    const { context, compareCommits } = createContext({
+    const { octokit, compareCommits } = createOctokit({
       reviews: [createBotReview()],
       comparisons: [
         {
@@ -305,7 +330,9 @@ describe('getChangedFiles', () => {
       ],
     });
 
-    await expect(getChangedFiles(context)).resolves.toEqual(pullRequestFiles);
+    await expect(getChangedFiles(octokit, baseParams)).resolves.toEqual(
+      pullRequestFiles
+    );
     expect(compareCommits).toHaveBeenCalledTimes(1);
     expect(compareCommits).toHaveBeenCalledWith({
       owner: 'owner',
@@ -316,7 +343,7 @@ describe('getChangedFiles', () => {
   });
 
   test('uses the synchronize before SHA when no prior bot review exists', async () => {
-    const { context, compareCommits } = createContext({
+    const { octokit, compareCommits } = createOctokit({
       comparisons: [
         {
           status: 'ahead',
@@ -325,7 +352,7 @@ describe('getChangedFiles', () => {
       ],
     });
 
-    await expect(getChangedFiles(context)).resolves.toEqual([
+    await expect(getChangedFiles(octokit, baseParams)).resolves.toEqual([
       pullRequestFiles[1],
     ]);
     expect(compareCommits).toHaveBeenCalledWith({
@@ -337,12 +364,14 @@ describe('getChangedFiles', () => {
   });
 
   test('uses the full pull request when the trusted review comparison fails', async () => {
-    const { context, compareCommits } = createContext({
+    const { octokit, compareCommits } = createOctokit({
       reviews: [createBotReview('LGTM 👍')],
       comparisons: [new Error('reviewed commit is unavailable')],
     });
 
-    await expect(getChangedFiles(context)).resolves.toEqual(pullRequestFiles);
+    await expect(getChangedFiles(octokit, baseParams)).resolves.toEqual(
+      pullRequestFiles
+    );
     expect(compareCommits).toHaveBeenCalledTimes(1);
     expect(compareCommits).toHaveBeenCalledWith({
       owner: 'owner',
@@ -353,7 +382,7 @@ describe('getChangedFiles', () => {
   });
 
   test('paginates pull request reviews before selecting the latest one', async () => {
-    const { context, listReviews, paginate } = createContext({
+    const { octokit, listReviews, paginate } = createOctokit({
       reviews: [createBotReview()],
       comparisons: [
         {
@@ -363,7 +392,7 @@ describe('getChangedFiles', () => {
       ],
     });
 
-    await getChangedFiles(context);
+    await getChangedFiles(octokit, baseParams);
 
     expect(paginate).toHaveBeenCalledWith(listReviews, {
       owner: 'owner',
@@ -371,6 +400,160 @@ describe('getChangedFiles', () => {
       pull_number: 123,
       per_page: 100,
     });
+  });
+
+  test('does not use an incomplete review as the incremental base', async () => {
+    // Otherwise the files that failed last time would never be asked for
+    // again, because every later run would diff from a commit that already
+    // contained them.
+    const { octokit, compareCommits } = createOctokit({
+      reviews: [createIncompleteBotReview()],
+      comparisons: [
+        {
+          status: 'ahead',
+          files: incrementalFiles,
+        },
+      ],
+    });
+
+    await expect(getChangedFiles(octokit, baseParams)).resolves.toEqual([
+      pullRequestFiles[1],
+    ]);
+    expect(compareCommits).toHaveBeenCalledWith({
+      owner: 'owner',
+      repo: 'repo',
+      base: 'previous-head',
+      head: 'current-head',
+    });
+  });
+
+  test('falls back to the push base when the last review was incomplete', async () => {
+    const { octokit, compareCommits } = createOctokit({
+      reviews: [createBotReview(), createIncompleteBotReview()],
+      comparisons: [
+        {
+          status: 'ahead',
+          files: pullRequestFiles,
+        },
+      ],
+    });
+
+    await expect(getChangedFiles(octokit, baseParams)).resolves.toEqual(
+      pullRequestFiles
+    );
+    expect(compareCommits).toHaveBeenCalledWith({
+      owner: 'owner',
+      repo: 'repo',
+      base: 'previous-head',
+      head: 'current-head',
+    });
+  });
+
+  test('uses the last complete review even when an older one was incomplete', async () => {
+    const { octokit, compareCommits } = createOctokit({
+      reviews: [createIncompleteBotReview(), createBotReview()],
+      comparisons: [
+        {
+          status: 'ahead',
+          files: incrementalFiles,
+        },
+      ],
+    });
+
+    await expect(getChangedFiles(octokit, baseParams)).resolves.toEqual([
+      pullRequestFiles[1],
+    ]);
+    expect(compareCommits).toHaveBeenCalledWith({
+      owner: 'owner',
+      repo: 'repo',
+      base: 'reviewed-head',
+      head: 'current-head',
+    });
+  });
+});
+
+describe('loadChat', () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    delete process.env['INPUT_GITHUB-TOKEN'];
+    delete process.env.GITHUB_TOKEN;
+    delete process.env.OPENAI_API_KEY;
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  test('uses OPENAI_API_KEY from env', async () => {
+    process.env.OPENAI_API_KEY = 'env-key';
+    const { octokit, getRepoVariable } = createOctokit();
+
+    const chat = await loadChat(octokit, 'owner', 'repo', 123);
+
+    expect(chat).toBeInstanceOf(Chat);
+    expect(getRepoVariable).not.toHaveBeenCalled();
+  });
+
+  test('falls back to the repo variable', async () => {
+    const { octokit, getRepoVariable } = createOctokit();
+    getRepoVariable.mockResolvedValue({ data: { value: 'var-key' } });
+
+    const chat = await loadChat(octokit, 'owner', 'repo', 123);
+
+    expect(chat).toBeInstanceOf(Chat);
+    expect(getRepoVariable).toHaveBeenCalledWith({
+      owner: 'owner',
+      repo: 'repo',
+      name: 'OPENAI_API_KEY',
+    });
+  });
+
+  test('returns null when the repo variable is empty', async () => {
+    const { octokit, getRepoVariable, createComment } = createOctokit();
+    getRepoVariable.mockResolvedValue({ data: {} });
+
+    await expect(loadChat(octokit, 'owner', 'repo', 123)).resolves.toBeNull();
+    expect(createComment).not.toHaveBeenCalled();
+  });
+
+  test('comments on the PR and returns null when the variable is a 404', async () => {
+    const { octokit, getRepoVariable, createComment } = createOctokit();
+    const notFound = Object.assign(new Error('Not Found'), { status: 404 });
+    getRepoVariable.mockRejectedValue(notFound);
+
+    await expect(loadChat(octokit, 'owner', 'repo', 123)).resolves.toBeNull();
+    expect(createComment).toHaveBeenCalledWith({
+      owner: 'owner',
+      repo: 'repo',
+      issue_number: 123,
+      body: expect.stringContaining('OPENAI_API_KEY'),
+    });
+  });
+
+  test('does not blame the configuration when the lookup is forbidden', async () => {
+    const { octokit, getRepoVariable, createComment } = createOctokit();
+    const forbidden = Object.assign(new Error('Forbidden'), { status: 403 });
+    getRepoVariable.mockRejectedValue(forbidden);
+
+    // A 403 says nothing about whether the variable is set, so it must not
+    // post the "you forgot to configure this" comment, and must not pass
+    // either: the run has to fail loudly instead of quietly skipping.
+    await expect(loadChat(octokit, 'owner', 'repo', 123)).rejects.toThrow(
+      /HTTP 403/
+    );
+    expect(createComment).not.toHaveBeenCalled();
+  });
+
+  test('surfaces a network failure instead of reporting a missing key', async () => {
+    const { octokit, getRepoVariable, createComment } = createOctokit();
+    getRepoVariable.mockRejectedValue(new Error('ECONNRESET'));
+
+    await expect(loadChat(octokit, 'owner', 'repo', 123)).rejects.toThrow(
+      /could not read the OPENAI_API_KEY repository variable/
+    );
+    expect(createComment).not.toHaveBeenCalled();
   });
 });
 
@@ -413,9 +596,9 @@ describe('isHunkHeaderInPatch', () => {
   });
 
   test('normalizes omitted single-line counts', () => {
-    expect(
-      isHunkHeaderInPatch('@@ -30 +30 @@', '@@ -30,1 +30,1 @@')
-    ).toBe(true);
+    expect(isHunkHeaderInPatch('@@ -30 +30 @@', '@@ -30,1 +30,1 @@')).toBe(
+      true
+    );
   });
 
   test('rejects a valid hunk range absent from the current patch', () => {
@@ -505,45 +688,79 @@ describe('createReviewBody', () => {
       'LGTM 👍\n\n<!-- chatgpt-code-review -->'
     );
   });
-});
 
-describe('robot', () => {
-  const githubActions = process.env.GITHUB_ACTIONS;
-
-  afterEach(() => {
-    if (githubActions === undefined) {
-      delete process.env.GITHUB_ACTIONS;
-    } else {
-      process.env.GITHUB_ACTIONS = githubActions;
-    }
-    process.exitCode = undefined;
+  test('warns about failed files and keeps the findings', () => {
+    expect(createReviewBody(true, [], ['src/broken.ts'])).toBe(
+      '> **Review incomplete.** Could not review 1 file(s): `src/broken.ts`\n\n' +
+        'Code review by ChatGPT\n\n<!-- chatgpt-code-review incomplete -->'
+    );
   });
 
-  test('marks the GitHub Action as failed when a webhook handler fails', () => {
-    process.env.GITHUB_ACTIONS = 'true';
-    const app = {
-      on: jest.fn(),
-      onError: jest.fn(),
-    };
+  test('does not claim LGTM when every file failed', () => {
+    const body = createReviewBody(false, [], ['a.ts', 'b.ts']);
 
-    robot(app as any);
-
-    expect(app.onError).toHaveBeenCalledTimes(1);
-    const errorHandler = app.onError.mock.calls[0][0];
-    errorHandler();
-    expect(process.exitCode).toBe(1);
+    expect(body).toContain('Could not review 2 file(s): `a.ts`, `b.ts`');
+    expect(body).not.toContain('LGTM');
+    expect(body).toContain('<!-- chatgpt-code-review incomplete -->');
   });
 
-  test('does not change process error handling outside GitHub Actions', () => {
-    delete process.env.GITHUB_ACTIONS;
-    const app = {
-      on: jest.fn(),
-      onError: jest.fn(),
-    };
+  test('wraps a backticked filename in a longer delimiter', () => {
+    // A backslash does not escape a backtick inside a markdown code span, so
+    // the delimiter has to grow instead.
+    expect(createReviewBody(false, [], ['we`ird.ts'])).toContain(
+      '``we`ird.ts``'
+    );
+  });
 
-    robot(app as any);
+  test('pads a filename that would otherwise merge with the delimiter', () => {
+    // Content starting with a backtick needs a space on both sides, or the
+    // span is parsed as empty. The delimiter is two backticks because the
+    // longest run inside the value is one.
+    const body = createReviewBody(false, [], ['`edge`.ts']);
 
-    expect(app.onError).not.toHaveBeenCalled();
-    expect(process.exitCode).toBeUndefined();
+    expect(body).toContain('`` `edge`.ts ``');
+  });
+
+  test('keeps unpositioned findings alongside the failure warning', () => {
+    const body = createReviewBody(false, ['**File:** `x.ts`\n\nFinding'], [
+      'y.ts',
+    ]);
+
+    expect(body).toContain('> **Review incomplete.**');
+    expect(body).toContain('**File:** `x.ts`\n\nFinding');
+    expect(body.endsWith('<!-- chatgpt-code-review incomplete -->')).toBe(true);
+  });
+
+  test('caps the file list so the body cannot exceed the size limit', () => {
+    const many = Array.from({ length: 40 }, (_, i) => `src/file-${i}.ts`);
+    const body = createReviewBody(false, [], many);
+
+    expect(body).toContain('Could not review 40 file(s)');
+    expect(body).toContain('`src/file-9.ts`');
+    expect(body).not.toContain('src/file-10.ts');
+    expect(body).toContain('(+30 more)');
+  });
+
+  test('reports skipped files as a coverage gap without failing the run', () => {
+    const body = createReviewBody(false, [], [], ['logo.png']);
+
+    expect(body).toContain('**Coverage gap.**');
+    expect(body).toContain('`logo.png`');
+    expect(body).not.toContain('LGTM');
+    // No failed file, so this review is a sound base for the next push.
+    expect(body.endsWith('<!-- chatgpt-code-review -->')).toBe(true);
+  });
+
+  test('does not claim LGTM when a file was skipped and nothing was found', () => {
+    const body = createReviewBody(false, [], [], ['a.ts', 'b.ts']);
+
+    expect(body).toContain('**Coverage gap.**');
+    expect(body).not.toContain('LGTM');
+  });
+
+  test('still claims LGTM when everything was reviewed', () => {
+    expect(createReviewBody(false, [], [], [])).toBe(
+      'LGTM 👍\n\n<!-- chatgpt-code-review -->'
+    );
   });
 });

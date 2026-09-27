@@ -8,6 +8,22 @@ const isReasoningEffort = (effort: string): effort is ReasoningEffort =>
   (reasoningEfforts as readonly string[]).includes(effort);
 
 /**
+ * Models that cannot be forced into JSON mode often wrap their answer in a
+ * markdown fence anyway. Unwrap it so the review still parses, rather than
+ * posting a ```json block as the comment body.
+ *
+ * The pattern is anchored to the whole payload on purpose. A review comment
+ * very often contains its own fenced example, and a non-greedy unanchored
+ * match would stop at that inner fence and extract the example instead of the
+ * review. Only an outer wrapper gets removed here.
+ */
+function stripJsonFence(content: string): string {
+  const trimmed = content.trim();
+  const fenced = trimmed.match(/^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n?```$/);
+  return fenced ? fenced[1].trim() : trimmed;
+}
+
+/**
  * Extra HTTP headers for OpenAI-compatible gateways that require
  * them. `OPENAI_EXTRA_HEADERS` takes a JSON object, e.g.
  * '{"x-opencode-session": "my-session"}'.
@@ -36,17 +52,25 @@ function extraHeaders(): Record<string, string> {
 export class Chat {
   private openai: OpenAI | AzureOpenAI;
   private isAzure: boolean;
-  private isGithubModels: boolean;
 
   private reasoningModels = ['o1', 'o1-2024-12-17', 'o1-mini', 'o1-mini-2024-09-12'];
   private reasoningPrefixes = ['o3', 'o4', 'gpt-5'];
 
   constructor(apikey: string) {
+    // GitHub Models was retired on 30 July 2026 along with its inference API.
+    // Silently ignoring the flag would send those users to OpenAI with the
+    // default model and a confusing failure, so name the migration instead.
+    if (process.env.USE_GITHUB_MODELS) {
+      throw new Error(
+        'USE_GITHUB_MODELS is no longer supported: GitHub Models and its ' +
+          'inference API were retired on 30 July 2026. Unset it and point ' +
+          'OPENAI_API_ENDPOINT and MODEL at an OpenAI-compatible endpoint.'
+      );
+    }
+
     this.isAzure = Boolean(
         process.env.AZURE_API_VERSION && process.env.AZURE_DEPLOYMENT,
     );
-
-    this.isGithubModels = process.env.USE_GITHUB_MODELS === 'true';
 
     if (this.isAzure) {
       // Azure OpenAI configuration
@@ -61,16 +85,18 @@ export class Chat {
       // Standard OpenAI configuration
       this.openai = new OpenAI({
         apiKey: apikey,
-        baseURL: this.isGithubModels ? 'https://models.github.ai/inference' : process.env.OPENAI_API_ENDPOINT || 'https://api.openai.com/v1',
+        baseURL: process.env.OPENAI_API_ENDPOINT || 'https://api.openai.com/v1',
         defaultHeaders: extraHeaders(),
       });
     }
   }
 
   private get model(): string {
-    return process.env.MODEL || (this.isGithubModels ? 'openai/gpt-4o-mini' : 'gpt-4o-mini');
+    return process.env.MODEL || 'gpt-4o-mini';
   }
 
+  // Gateways may namespace model ids, e.g. "openai/o3-mini", so match the
+  // reasoning families on the last segment.
   private get normalizedModel(): string {
     return this.model.split('/').pop() || this.model;
   }
@@ -123,7 +149,6 @@ export class Chat {
       };
     }
 
-    console.time('code-review cost');
     const prompt = this.generatePrompt(patch);
 
     const isReasoning = this.isReasoningModel;
@@ -145,29 +170,36 @@ export class Chat {
       response_format: { type: "json_object" },
     });
 
-    console.timeEnd('code-review cost');
+    const choices = res.choices;
 
-    if (res.choices.length) {
-      try {
-        const json = JSON.parse(res.choices[0].message.content || "");
-        // If response has a 'reviews' array, return it directly
-        if (json.reviews && Array.isArray(json.reviews)) {
-          return json.reviews;
-        }
-        // Otherwise, treat as a single review response
-        return json;
-      } catch (e) {
-        return {
-          lgtm: false,
-          hunk_header: patch.split('\n')[0].startsWith('@@') ? patch.split('\n')[0] : undefined,
-          review_comment: res.choices[0].message.content || ""
-        }
-      }
+    if (!choices?.length) {
+      // Guard before touching `.length`: a gateway can resolve with a payload
+      // that has no `choices` at all, and dereferencing it threw a TypeError
+      // that hid the real response. Failing loudly keeps the payload in the
+      // message, and reporting LGTM here would claim "no issues" for a review
+      // that never actually ran.
+      throw new Error(
+        `no choices in response from ${this.model}: ${JSON.stringify(res).slice(0, 500)}`
+      );
     }
 
-    return {
-      lgtm: true,
-      review_comment: ""
+    const content = choices[0].message?.content || '';
+
+    try {
+      const json = JSON.parse(stripJsonFence(content));
+      // If response has a 'reviews' array, return it directly
+      if (json.reviews && Array.isArray(json.reviews)) {
+        return json.reviews;
+      }
+      // Otherwise, treat as a single review response
+      return json;
+    } catch {
+      // Not valid JSON. Surface the raw text so the finding is not lost.
+      return {
+        lgtm: false,
+        hunk_header: patch.split('\n')[0].startsWith('@@') ? patch.split('\n')[0] : undefined,
+        review_comment: content
+      }
     }
   };
 }

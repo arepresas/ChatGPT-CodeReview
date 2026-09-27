@@ -3,20 +3,48 @@ name: Code Review
 permissions:
   contents: read
   pull-requests: write
-  models: read
+  actions: read
 
 on:
   pull_request:
     types: [opened, reopened, synchronize]
 
+concurrency:
+  group: code-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: anc95/ChatGPT-CodeReview@main
+      # The action reads the diff through the API, so it does not need the PR
+      # code on disk. Checking out the base commit keeps the action itself
+      # trusted: with `uses: ./` on the default merge ref, whoever opens the
+      # pull request would control action.yml and the bundle, and that code
+      # would receive OPENAI_API_KEY plus a token with pull-requests: write.
+      #
+      # persist-credentials: false keeps the checkout from writing a token
+      # into .git/config where that same code could read it.
+      #
+      # The tradeoff is that this workflow no longer dogfoods changes to the
+      # action itself; it always runs the base revision. To test a change to
+      # the action, run it from a trusted branch, or accept the exposure
+      # knowingly when the repository is single-author.
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - uses: ./
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LANGUAGE: English
-          USE_GITHUB_MODELS: true
-          LOG_LEVEL: debug
           INCLUDE_PATTERNS: src/*,.github/**/*
+          # Secret: the credential itself.
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Repository variables: change these from the Variables tab without
+          # touching this file. Empty values fall back to the action defaults
+          # (https://api.openai.com/v1 and gpt-4o-mini).
+          OPENAI_API_ENDPOINT: ${{ vars.OPENAI_API_ENDPOINT }}
+          MODEL: ${{ vars.MODEL }}
+          OPENCODE_SESSION: ${{ vars.OPENCODE_SESSION }}
+          OPENAI_EXTRA_HEADERS: ${{ vars.OPENAI_EXTRA_HEADERS }}

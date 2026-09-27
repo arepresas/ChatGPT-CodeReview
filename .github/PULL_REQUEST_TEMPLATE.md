@@ -15,7 +15,7 @@
 ## Modules touched
 
 - [ ] `src/bot.ts` (review logic, filters, inline comments)
-- [ ] `src/chat.ts` (LLM client: OpenAI / Azure / GitHub Models)
+- [ ] `src/chat.ts` (LLM client: OpenAI / Azure / OpenAI-compatible gateway)
 - [ ] `src/github-action.cjs` / `src/fetch-polyfill.cjs` / `src/log.ts` (Action runtime)
 - [ ] `action/index.cjs` (rebuilt bundle, must be committed)
 - [ ] `action.yml` (Action definition)

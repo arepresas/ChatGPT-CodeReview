@@ -1,19 +1,48 @@
-import { Context, Probot } from 'probot';
-import { minimatch } from 'minimatch'
+import * as core from '@actions/core';
+import * as github from '@actions/github';
+import { minimatch } from 'minimatch';
 
 import { Chat } from './chat.js';
-import log from 'loglevel';
 
 const OPENAI_API_KEY = 'OPENAI_API_KEY';
 const COMPARE_FILES_LIMIT = 300;
 const REVIEW_MARKER = '<!-- chatgpt-code-review -->';
+// An incomplete review did not inspect every file, so it cannot be trusted as
+// the base for the next incremental pass. Using one would permanently skip the
+// files that failed, since nothing would ever ask for them again.
+const INCOMPLETE_MARKER = '<!-- chatgpt-code-review incomplete -->';
+const MAX_LISTED_FILES = 10;
+const SUPPORTED_ACTIONS = new Set(['opened', 'reopened', 'synchronize']);
 const MAX_PATCH_COUNT = process.env.MAX_PATCH_LENGTH
   ? +process.env.MAX_PATCH_LENGTH
   : Infinity;
 
-type PullRequestContext = Context<
-  'pull_request.opened' | 'pull_request.synchronize'
->;
+type ChangedFile = {
+  filename: string;
+  status?: string;
+  contents_url: string;
+  patch?: string;
+};
+
+type Octokit = ReturnType<typeof github.getOctokit>;
+
+type ChangedFilesParams = {
+  owner: string;
+  repo: string;
+  pull_number: number;
+  action: string;
+  before?: string;
+  headSha: string;
+};
+
+type PullRequestPayload = {
+  number: number;
+  state?: string;
+  locked?: boolean;
+  labels?: Array<{ name?: string }>;
+  head: { sha: string };
+  html_url?: string;
+};
 
 const parseHunkHeader = (hunkHeader?: string) => {
   if (!hunkHeader) {
@@ -103,58 +132,157 @@ export const createInlineReviewComment = (
   };
 };
 
-export const createReviewBody = (
-  hasInlineComments: boolean,
-  bodyComments: string[]
-) => {
-  const heading =
-    hasInlineComments || bodyComments.length
-      ? 'Code review by ChatGPT'
-      : 'LGTM 👍';
-  return [heading, ...bodyComments, REVIEW_MARKER].join('\n\n');
+/**
+ * Renders a value as a markdown code span.
+ *
+ * Backslash escapes are not processed inside a code span, so escaping a
+ * backtick with a backslash does not work: the backtick closes the span early
+ * and the backslash shows up literally. Instead use a delimiter one backtick
+ * longer than the longest run in the value, and pad when the value itself
+ * starts or ends with a backtick.
+ */
+const codeSpan = (value: string): string => {
+  const runs = value.match(/`+/g) || [];
+  let longestRun = 0;
+  for (const run of runs) {
+    if (run.length > longestRun) {
+      longestRun = run.length;
+    }
+  }
+  const fence = '`'.repeat(longestRun + 1);
+  const pad = value.startsWith('`') || value.endsWith('`') ? ' ' : '';
+  return `${fence}${pad}${value}${pad}${fence}`;
 };
 
-export const getChangedFiles = async (context: PullRequestContext) => {
-  const repo = context.repo();
-  const pullRequestFiles = await context.octokit.paginate(
-    context.octokit.pulls.listFiles,
+/**
+ * Keeps the review body bounded. A wide outage can fail hundreds of files, and
+ * GitHub rejects a body that exceeds its size limit, which would throw away
+ * every finding that did succeed.
+ */
+const listFiles = (files: string[]): string => {
+  const shown = files.slice(0, MAX_LISTED_FILES).map(codeSpan).join(', ');
+  const rest = files.length - MAX_LISTED_FILES;
+  return rest > 0 ? `${shown} (+${rest} more)` : shown;
+};
+
+const splitPatterns = (raw: string | undefined): string[] =>
+  (raw || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+const splitLines = (raw: string | undefined): string[] =>
+  (raw || '')
+    .split('\n')
+    .map((value) => value.replace(/\r$/, '').trim())
+    .filter(Boolean);
+
+/**
+ * Builds the review body.
+ *
+ * `failedFiles` are files whose review attempt errored, which makes the run
+ * incomplete. `skippedFiles` are files that carried no usable diff, such as
+ * binaries or oversized patches; retrying them would not help, so they do not
+ * invalidate the run, but they are still a gap in coverage.
+ *
+ * LGTM is only claimed when nothing was reported and nothing was missed.
+ * Reporting "no issues" for a review that never inspected the code is worse
+ * than reporting nothing. The review marker is always kept so the next push
+ * can still find this review as its base.
+ */
+export const createReviewBody = (
+  hasInlineComments: boolean,
+  bodyComments: string[],
+  failedFiles: string[] = [],
+  skippedFiles: string[] = []
+) => {
+  const sections: string[] = [];
+
+  if (failedFiles.length) {
+    sections.push(
+      `> **Review incomplete.** Could not review ${failedFiles.length} file(s): ${listFiles(failedFiles)}`
+    );
+  }
+
+  if (skippedFiles.length) {
+    sections.push(
+      `> **Coverage gap.** No reviewable diff for ${skippedFiles.length} file(s): ${listFiles(skippedFiles)}`
+    );
+  }
+
+  const hasFindings = hasInlineComments || bodyComments.length > 0;
+  const completeCoverage = !failedFiles.length && !skippedFiles.length;
+  if (hasFindings) {
+    sections.push('Code review by ChatGPT');
+  } else if (completeCoverage) {
+    sections.push('LGTM 👍');
+  }
+
+  sections.push(...bodyComments);
+  sections.push(failedFiles.length ? INCOMPLETE_MARKER : REVIEW_MARKER);
+
+  return sections.join('\n\n');
+};
+
+export const getChangedFiles = async (
+  octokit: Octokit,
+  params: ChangedFilesParams
+): Promise<ChangedFile[]> => {
+  const { owner, repo, pull_number, action, before, headSha } = params;
+  const pullRequestFiles = (await octokit.paginate(
+    octokit.rest.pulls.listFiles,
     {
-      owner: repo.owner,
-      repo: repo.repo,
-      pull_number: context.pullRequest().pull_number,
+      owner,
+      repo,
+      pull_number,
       per_page: 100,
     }
-  );
+  )) as ChangedFile[];
 
-  if (context.payload.action !== 'synchronize') {
+  if (action !== 'synchronize') {
     return pullRequestFiles;
   }
 
   let comparisonBase: string | undefined;
 
   try {
-    const reviews = await context.octokit.paginate(
-      context.octokit.pulls.listReviews,
+    const reviews = (await octokit.paginate(
+      octokit.rest.pulls.listReviews,
       {
-        owner: repo.owner,
-        repo: repo.repo,
-        pull_number: context.pullRequest().pull_number,
+        owner,
+        repo,
+        pull_number,
         per_page: 100,
       }
-    );
+    )) as Array<{
+      body?: string | null;
+      commit_id?: string | null;
+      user?: { type?: string } | null;
+    }>;
     const botReview = reviews
       .slice()
       .reverse()
-      .find((r) =>
-        r.user?.type === 'Bot' &&
-        r.body?.includes(REVIEW_MARKER)
+      .find(
+        (r) =>
+          r.user?.type === 'Bot' &&
+          (r.body?.includes(REVIEW_MARKER) ||
+            r.body?.includes(INCOMPLETE_MARKER))
       );
 
     if (botReview) {
       if (!botReview.commit_id) {
         return pullRequestFiles;
       }
-      comparisonBase = botReview.commit_id;
+      if (botReview.body?.includes(INCOMPLETE_MARKER)) {
+        // The previous pass did not finish, so it is not a sound base. Fall
+        // back to the synchronize `before` SHA so the files it missed get
+        // another chance on this push.
+        core.debug(
+          `previous review at ${botReview.commit_id} was incomplete; re-reviewing from the push base`
+        );
+      } else {
+        comparisonBase = botReview.commit_id;
+      }
     } else {
       const hasLegacyReview = reviews.some(
         (r) =>
@@ -168,12 +296,12 @@ export const getChangedFiles = async (context: PullRequestContext) => {
       }
     }
   } catch (err) {
-    log.debug('failed to detect previous bot review', err);
+    core.debug(`failed to detect previous bot review: ${err}`);
     return pullRequestFiles;
   }
 
   if (!comparisonBase) {
-    comparisonBase = context.payload.before;
+    comparisonBase = before;
   }
 
   if (!comparisonBase) {
@@ -181,11 +309,11 @@ export const getChangedFiles = async (context: PullRequestContext) => {
   }
 
   try {
-    const { data } = await context.octokit.repos.compareCommits({
-      owner: repo.owner,
-      repo: repo.repo,
+    const { data } = await octokit.rest.repos.compareCommits({
+      owner,
+      repo,
       base: comparisonBase,
-      head: context.payload.pull_request.head.sha,
+      head: headSha,
     });
 
     if (data.status === 'identical') {
@@ -194,7 +322,7 @@ export const getChangedFiles = async (context: PullRequestContext) => {
 
     if (data.status === 'ahead') {
       if (!data.files) {
-        log.debug(
+        core.debug(
           'commit comparison omitted files; using the full pull request diff'
         );
         return pullRequestFiles;
@@ -202,7 +330,7 @@ export const getChangedFiles = async (context: PullRequestContext) => {
 
       const comparisonFiles = data.files;
       if (comparisonFiles.length >= COMPARE_FILES_LIMIT) {
-        log.debug(
+        core.debug(
           'commit comparison reached the GitHub file limit; using the full pull request diff'
         );
         return pullRequestFiles;
@@ -216,222 +344,303 @@ export const getChangedFiles = async (context: PullRequestContext) => {
       );
     }
 
-    log.debug(
+    core.debug(
       `commit comparison from ${comparisonBase} is ${data.status}; using the full pull request diff`
     );
   } catch (err) {
-    log.debug(`failed to compare commits from ${comparisonBase}`, err);
+    core.debug(`failed to compare commits from ${comparisonBase}: ${err}`);
   }
 
   return pullRequestFiles;
 };
 
-export const robot = (app: Probot) => {
-  if (process.env.GITHUB_ACTIONS === 'true') {
-    app.onError(() => {
-      process.exitCode = 1;
-    });
+export const loadChat = async (
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  pull_number: number
+): Promise<Chat | null> => {
+  if (process.env.OPENAI_API_KEY) {
+    return new Chat(process.env.OPENAI_API_KEY);
   }
 
-  const loadChat = async (context: Context) => {
-    if (process.env.USE_GITHUB_MODELS === 'true' && process.env.GITHUB_TOKEN) {
-      return new Chat(process.env.GITHUB_TOKEN);
-    }
+  try {
+    const { data } = await octokit.rest.actions.getRepoVariable({
+      owner,
+      repo,
+      name: OPENAI_API_KEY,
+    });
 
-    if (process.env.OPENAI_API_KEY) {
-      return new Chat(process.env.OPENAI_API_KEY);
-    }
-
-    const repo = context.repo();
-
-    try {
-      const { data } = (await context.octokit.request(
-        'GET /repos/{owner}/{repo}/actions/variables/{name}',
-        {
-          owner: repo.owner,
-          repo: repo.repo,
-          name: OPENAI_API_KEY,
-        }
-      )) as any;
-
-      if (!data?.value) {
-        return null;
-      }
-
-      return new Chat(data.value);
-    } catch {
-      await context.octokit.issues.createComment({
-        repo: repo.repo,
-        owner: repo.owner,
-        issue_number: context.pullRequest().pull_number,
-        body: `Seems you are using me but didn't get OPENAI_API_KEY seted in Variables/Secrets for this repo. you could follow [readme](https://github.com/anc95/ChatGPT-CodeReview) for more information`,
-      });
+    if (!data?.value) {
       return null;
     }
-  };
 
-  app.on(
-    ['pull_request.opened', 'pull_request.synchronize'],
-    async (context) => {
-      const repo = context.repo();
-      const chat = await loadChat(context);
+    return new Chat(data.value);
+  } catch (err) {
+    const status = (err as { status?: number })?.status;
+    if (status !== 404) {
+      // A 403, a rate limit or a network blip says nothing about whether the
+      // variable is configured, so do not tell the user it is missing.
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `could not read the ${OPENAI_API_KEY} repository variable (HTTP ${status ?? 'no status'}): ${detail}`
+      );
+    }
 
-      if (!chat) {
-        log.info('Chat initialized failed');
-        return 'no chat';
+    try {
+      await octokit.rest.issues.createComment({
+        owner,
+        repo,
+        issue_number: pull_number,
+        body: `ChatGPT CodeReview is running, but no LLM credential was found. Set OPENAI_API_KEY in this repository's Actions secrets or Variables. See the action README for details.`,
+      });
+    } catch (commentErr) {
+      core.debug(`failed to post missing-key comment: ${commentErr}`);
+    }
+    return null;
+  }
+};
+
+export const run = async (): Promise<string> => {
+  try {
+    if (
+      github.context.eventName !== 'pull_request' &&
+      github.context.eventName !== 'pull_request_target'
+    ) {
+      core.warning(`unsupported event: ${github.context.eventName}`);
+      return 'skipped event';
+    }
+
+    const pull_request = github.context.payload
+      .pull_request as PullRequestPayload | undefined;
+
+    if (!pull_request) {
+      core.warning('no pull_request in event payload');
+      return 'no pull request';
+    }
+
+    const { owner, repo } = github.context.repo;
+    const rawAction = github.context.payload.action;
+    const action = typeof rawAction === 'string' ? rawAction : '';
+
+    // Checked before anything else, so an unconfigured action never posts a
+    // missing-credential comment, and so `labeled`, `edited` and friends do not
+    // each trigger a full review of the whole pull request.
+    if (!SUPPORTED_ACTIONS.has(action)) {
+      core.warning(`unsupported pull_request action: ${action || '(none)'}`);
+      return 'skipped action';
+    }
+
+    const rawBefore = github.context.payload.before;
+    const before = typeof rawBefore === 'string' ? rawBefore : undefined;
+
+    const pull_number = pull_request.number;
+    const token =
+      core.getInput('github-token') || process.env.GITHUB_TOKEN || '';
+    if (!token) {
+      core.setFailed(
+        'GITHUB_TOKEN is missing. Pass it via the github-token input or GITHUB_TOKEN env.'
+      );
+      return 'no token';
+    }
+    const octokit = github.getOctokit(token);
+    const chat = await loadChat(octokit, owner, repo, pull_number);
+
+    if (!chat) {
+      core.info('Chat initialized failed');
+      return 'no chat';
+    }
+
+    core.debug(`pull_request: ${pull_request.number}`);
+
+    if (pull_request.state === 'closed' || pull_request.locked) {
+      core.info('invalid event payload');
+      return 'invalid event payload';
+    }
+
+    const target_label = process.env.TARGET_LABEL;
+    if (
+      target_label &&
+      (!pull_request.labels?.length ||
+        pull_request.labels.every((label) => label.name !== target_label))
+    ) {
+      core.info('no target label attached');
+      return 'no target label attached';
+    }
+
+    let changedFiles = await getChangedFiles(octokit, {
+      owner,
+      repo,
+      pull_number,
+      action,
+      before,
+      headSha: pull_request.head.sha,
+    });
+
+    core.debug(`changedFiles: ${changedFiles.length}`);
+
+    const ignoreList = splitLines(process.env.IGNORE || process.env.ignore);
+    const ignorePatterns = splitPatterns(process.env.IGNORE_PATTERNS);
+    const includePatterns = splitPatterns(process.env.INCLUDE_PATTERNS);
+
+    core.debug(`ignoreList: ${JSON.stringify(ignoreList)}`);
+    core.debug(`ignorePatterns: ${JSON.stringify(ignorePatterns)}`);
+    core.debug(`includePatterns: ${JSON.stringify(includePatterns)}`);
+
+    changedFiles = changedFiles.filter((file) => {
+      const url = new URL(file.contents_url);
+      const pathname = decodeURIComponent(url.pathname);
+      // if includePatterns is not empty, only include files that match the pattern
+      if (includePatterns.length) {
+        return matchPatterns(includePatterns, pathname);
       }
 
-      const pull_request = context.payload.pull_request;
-
-      log.debug('pull_request:', pull_request);
-
-      if (
-        pull_request.state === 'closed' ||
-        pull_request.locked
-      ) {
-        log.info('invalid event payload');
-        return 'invalid event payload';
+      if (ignoreList.includes(file.filename)) {
+        return false;
       }
 
-      const target_label = process.env.TARGET_LABEL;
-      if (
-        target_label &&
-        (!pull_request.labels?.length ||
-          pull_request.labels.every((label) => label.name !== target_label))
-      ) {
-        log.info('no target label attached');
-        return 'no target label attached';
+      // if ignorePatterns is not empty, ignore files that match the pattern
+      if (ignorePatterns.length) {
+        return !matchPatterns(ignorePatterns, pathname);
       }
 
-      let changedFiles = await getChangedFiles(context);
+      return true;
+    });
 
-      log.debug('changedFiles:', changedFiles);
-      log.debug
+    if (!changedFiles.length) {
+      core.info('no change found');
+      return 'no change';
+    }
 
-      const ignoreList = (process.env.IGNORE || process.env.ignore || '')
-          .split('\n')
-          .filter((v) => v !== '');
-      const ignorePatterns = (process.env.IGNORE_PATTERNS || '').split(',').filter((v) => Boolean(v.trim()));
-      const includePatterns = (process.env.INCLUDE_PATTERNS || '').split(',').filter((v) => Boolean(v.trim()));
+    const ress: Array<{
+      path: string;
+      body: string;
+      line: number;
+      side: 'RIGHT' | 'LEFT';
+    }> = [];
+    const bodyComments: string[] = [];
+    const failedFiles: string[] = [];
+    // Files that carried no reviewable diff. Retrying them cannot help, so
+    // they do not make the run incomplete, but they are a real gap in
+    // coverage and must not be reported as LGTM.
+    const skippedFiles: string[] = [];
 
-      log.debug('ignoreList:', ignoreList);
-      log.debug('ignorePatterns:', ignorePatterns);
-      log.debug('includePatterns:', includePatterns);
+    for (let i = 0; i < changedFiles.length; i++) {
+      const file = changedFiles[i];
+      const patch = file.patch || '';
 
-      changedFiles = changedFiles?.filter(
-        (file) => {
-          const url = new URL(file.contents_url)
-          const pathname = decodeURIComponent(url.pathname)
-          // if includePatterns is not empty, only include files that match the pattern
-          if (includePatterns.length) {
-            return matchPatterns(includePatterns, pathname)
-          }
-
-          if (ignoreList.includes(file.filename)) {
-            return false;
-          }
-
-          // if ignorePatterns is not empty, ignore files that match the pattern
-          if (ignorePatterns.length) {
-            return !matchPatterns(ignorePatterns, pathname)
-          }
-
-          return true
-      })
-
-      if (!changedFiles?.length) {
-        log.info('no change found');
-        return 'no change';
+      if (file.status !== 'modified' && file.status !== 'added') {
+        // Deleted or renamed. There is no new content to review, so this is a
+        // policy exclusion rather than a gap in coverage.
+        core.info(`${file.filename} skipped: status is ${file.status}`);
+        continue;
       }
 
-      console.time('gpt cost');
+      if (!patch) {
+        core.info(`${file.filename} skipped: no diff available (binary?)`);
+        skippedFiles.push(file.filename);
+        continue;
+      }
 
-      const ress = [];
-      const bodyComments = [];
-
-      for (let i = 0; i < changedFiles.length; i++) {
-        const file = changedFiles[i];
-        const patch = file.patch || '';
-
-        if (file.status !== 'modified' && file.status !== 'added') {
-          continue;
-        }
-
-        if (!patch || patch.length > MAX_PATCH_COUNT) {
-          log.info(
-            `${file.filename} skipped caused by its diff is too large`
-          );
-          continue;
-        }
-        try {
-          const res = await chat?.codeReview(patch);
-          // res can be a single review or an array of reviews (one for each hunk)
-          const reviews = Array.isArray(res) ? res : [res];
-          
-          for (const review of reviews) {
-            if (!review.lgtm && !!review.review_comment) {
-              const inlineComment = createInlineReviewComment(
-                file.filename,
-                review.review_comment,
-                review.hunk_header,
-                patch
-              );
-              if (!inlineComment) {
-                const filename = file.filename.replace(/`/g, '\\`');
-                bodyComments.push(
-                  `**File:** \`${filename}\`\n\n${review.review_comment}`
-                );
-                log.error(
-                  `Failed to locate inline review comment: ${review.hunk_header || 'missing hunk header'}`
-                );
-                continue;
-              }
-
-              ress.push(inlineComment)
-            }
-          }
-        } catch (e) {
-          log.info(`review ${file.filename} failed`, e);
-          throw e;
-        }
+      if (patch.length > MAX_PATCH_COUNT) {
+        core.info(
+          `${file.filename} skipped: diff of ${patch.length} exceeds MAX_PATCH_LENGTH`
+        );
+        skippedFiles.push(file.filename);
+        continue;
       }
       try {
-        await context.octokit.pulls.createReview({
-          repo: repo.repo,
-          owner: repo.owner,
-          pull_number: context.pullRequest().pull_number,
-          body: createReviewBody(ress.length > 0, bodyComments),
-          event: 'COMMENT',
-          commit_id: context.payload.pull_request.head.sha,
-          comments: ress,
-        });
+        const res = await chat.codeReview(patch);
+        // res can be a single review or an array of reviews (one for each hunk)
+        const reviews = Array.isArray(res) ? res : [res];
+
+        for (const review of reviews) {
+          if (!review.lgtm && !!review.review_comment) {
+            const inlineComment = createInlineReviewComment(
+              file.filename,
+              review.review_comment,
+              review.hunk_header,
+              patch
+            );
+            if (!inlineComment) {
+              bodyComments.push(
+                `**File:** ${codeSpan(file.filename)}\n\n${review.review_comment}`
+              );
+              core.error(
+                `Failed to locate inline review comment: ${review.hunk_header || 'missing hunk header'}`
+              );
+              continue;
+            }
+
+            ress.push(inlineComment);
+          }
+        }
       } catch (e) {
-        log.info(`Failed to create review`, e);
-        throw e;
+        // Keep going so the remaining files are still reviewed and the findings
+        // already collected are not lost to a single bad file. The step is
+        // failed after the review is posted, so the error still shows in CI.
+        const message = e instanceof Error ? e.message : String(e);
+        core.warning(`review ${file.filename} failed: ${message}`);
+        failedFiles.push(file.filename);
       }
-
-      console.timeEnd('gpt cost');
-      log.info(
-        'successfully reviewed',
-        context.payload.pull_request.html_url
-      );
-
-      return 'success';
     }
-  );
+    try {
+      await octokit.rest.pulls.createReview({
+        owner,
+        repo,
+        pull_number,
+        body: createReviewBody(
+          ress.length > 0,
+          bodyComments,
+          failedFiles,
+          skippedFiles
+        ),
+        event: 'COMMENT',
+        commit_id: pull_request.head.sha,
+        comments: ress,
+      });
+    } catch (e) {
+      core.info(`Failed to create review: ${e}`);
+      throw e;
+    }
+
+    if (failedFiles.length) {
+      core.setFailed(
+        `could not review ${failedFiles.length} file(s): ${failedFiles.join(', ')}`
+      );
+      return 'partial failure';
+    }
+
+    core.info(`successfully reviewed ${pull_request.html_url}`);
+    return 'success';
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    core.setFailed(message);
+    throw error;
+  }
+};
+
+const toGlob = (pattern: string) => {
+  if (pattern.startsWith('/')) {
+    return '**' + pattern;
+  }
+  if (pattern.startsWith('**')) {
+    return pattern;
+  }
+  return '**/' + pattern;
 };
 
 const matchPatterns = (patterns: string[], path: string) => {
   return patterns.some((pattern) => {
     try {
-      return minimatch(path, pattern.startsWith('/') ? "**" + pattern : pattern.startsWith("**") ? pattern : "**/" + pattern);
+      return minimatch(path, toGlob(pattern));
     } catch {
       // if the pattern is not a valid glob pattern, try to match it as a regular expression
       try {
         return new RegExp(pattern).test(path);
-      } catch (e) {
+      } catch {
         return false;
       }
     }
-  })
-}
+  });
+};

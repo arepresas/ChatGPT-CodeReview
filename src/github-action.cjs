@@ -1,6 +1,12 @@
-require('./fetch-polyfill.cjs');
-const { run } = require('@probot/adapter-github-actions');
-const { robot } = require('./bot');
-require('./log');
+const { run } = require('./bot');
 
-run(robot);
+run().catch((error) => {
+  // run() already reports through core.setFailed, but a rejection that escapes
+  // an unexpected path would otherwise vanish and leave only a bare exit code.
+  if (error instanceof Error) {
+    console.error(error.stack || error.message);
+  } else {
+    console.error(error);
+  }
+  process.exitCode = 1;
+});
