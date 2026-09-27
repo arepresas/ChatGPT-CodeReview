@@ -1,0 +1,47 @@
+name: Release
+
+# Manual only. The version comes from the conventional commits on main, never
+# from a number typed here, so a release cannot drift from its history.
+on:
+  workflow_dispatch:
+
+permissions:
+  # Creating the tag and the release. Nothing else.
+  contents: write
+
+# Serialize dispatches. Two overlapping runs would race to create the same tag,
+# and cancel-in-progress is off so a queued release waits rather than being
+# killed halfway through.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Guard against dispatching from anywhere but main, where the config only
+    # releases from anyway.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth 0: the version is derived by reading the whole commit
+      # history, so a shallow clone would silently produce the wrong result.
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      # No npm plugin: this is a GitHub Action, the tag is the version.
+      # The plugins resolve from the .releaserc.json, so the major below only
+      # pins the core tool. semantic-release resolves and installs missing
+      # plugins itself, which is why the three plugins are not in package.json.
+      #
+      # Pinned to major 24 rather than the current 25. Version 25 requires node
+      # >= 24.10.0, and while `node-version: 24` does resolve above that today,
+      # a release job should not depend on where the node line happens to sit.
+      # Version 24 requires >= 20.8.1 and has no floor to trip over.
+      - name: Release
+        run: npx --yes semantic-release@24
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
